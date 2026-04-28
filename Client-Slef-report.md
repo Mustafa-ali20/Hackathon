@@ -1,4 +1,3 @@
-Got it — I see what’s happening. GitHub’s Mermaid renderer is **stricter than normal Mermaid**, and a few things in your full file are still breaking it:
 
 ### 🔥 Root causes (in your file)
 
