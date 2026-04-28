@@ -118,7 +118,7 @@ backend/
 
 ## 🧱 Architecture Overview
 
-
+```
 ┌─────────────────────────────────────────────────────┐
 │  LAYER 1 — PRESENTATION                             │
 │  Pages, Layouts, UI Components, Views               │
@@ -132,7 +132,7 @@ backend/
 │  LAYER 4 — INFRASTRUCTURE                           │
 │  Config, Utils, Hooks, Constants, Types, Validators │
 └─────────────────────────────────────────────────────┘
-
+```
 
 ---
 
