@@ -1,0 +1,564 @@
+Client self-reports (tiny snippet on their side): If a client wants their own backend to report incidents (like an internal database crash that UptimeRobot can't see), they add one fetch() call to their error handler that hits your /api/incidents endpoint with their API key. That's all they add — literally 10 lines. You show this in your pitch as "advanced integration."
+
+Client Backend                            
+random.com's server
+Payment Service
+Auth Service      API Key + payload 
+Database Layer
+SDK / API call
+your npm package
+
+
+Your Platform API
+incident-platform backend
+POST /api/incidents/report
+API Key auth middleware
+Rate limiter (100 req/hr)
+Create / update incident
+WebSocket broadcast
+Auto-severity detection
+MongoDB
+incidents + api_keys + teams
+
+
+CODE EXAMPLES FOR THESE TOICS
+1.FOLDER STRUCTURE 
+2.API KEY SYSTEM
+3.REPORT ENDPOINT
+4.AUTO SEVERITY
+5.RATE LIMITER
+6.CLIENT SDK
+7.NOTIFICATIONS
+8.TEAM DASHBOARD
+
+1. SAMPLE FOLDER STRUCTURE
+incident-platform/
+│
+├── server.js                   # entry — mounts everything
+├── .env
+├── package.json
+│
+├── models/
+│   ├── Team.js                 # company that signed up
+│   ├── ApiKey.js               # hashed API keys per team
+│   ├── Incident.js             # incident document
+│   └── Service.js              # services a team registers
+│
+├── routes/
+│   ├── auth.js                 # signup, login, JWT
+│   ├── apikeys.js              # generate / revoke API keys
+│   ├── incidents.js            # CRUD + report endpoint
+│   ├── services.js             # team registers their services
+│   ├── timeline.js             # post updates to incidents
+│   ├── status.js               # public status page data
+│   └── simulate.js             # demo trigger
+│
+├── middleware/
+│   ├── apiKeyAuth.js           # validates X-API-Key header
+│   ├── jwtAuth.js              # validates dashboard login
+│   └── rateLimiter.js          # per-team request limits
+│
+├── services/
+│   ├── incidentService.js      # core create/update logic
+│   ├── severityDetector.js     # auto-assigns P1/P2/P3
+│   ├── notificationService.js  # email + slack alerts
+│   └── aiService.js            # Claude API for postmortem
+│
+├── socket/
+│   └── index.js                # socket.io setup + rooms
+│
+└── sdk/                        # tiny npm package for clients
+    └── incident-reporter.js
+
+
+The 3 MongoDB collections you need
+Teams collection — one doc per company
+{
+  _id, name: "Acme Corp",
+  email: "ops@acme.com",
+  plan: "free",
+  services: ["Payment API", "Website", "Auth"],
+  createdAt
+}
+
+ApiKeys collection — one team can have many keys
+{
+  _id,
+  teamId: ObjectId,
+  keyHash: "sha256-hashed-key",   // NEVER store raw key
+  label: "Production server",
+  lastUsed: Date,
+  createdAt
+}
+
+Incidents collection — core data
+{
+  _id,
+  teamId: ObjectId,
+  title, severity, status,
+  affectedServices: [],
+  source: "api" | "manual" | "uptimerobot" | "simulator",
+  timeline: [{ message, author, type, createdAt }],
+  resolvedAt, createdAt
+}
+
+
+
+2. API KEY SYSTEM:
+
+models/ApiKey.js
+const mongoose = require('mongoose');
+const crypto = require('crypto');
+
+const ApiKeySchema = new mongoose.Schema({
+  teamId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Team', required: true },
+  keyHash:  { type: String, required: true, unique: true },
+  label:    { type: String, default: 'Default key' },
+  lastUsed: { type: Date },
+  createdAt:{ type: Date, default: Date.now }
+});
+
+// Static helper to hash a raw key
+ApiKeySchema.statics.hashKey = (rawKey) =>
+  crypto.createHash('sha256').update(rawKey).digest('hex');
+
+module.exports = mongoose.model('ApiKey', ApiKeySchema);
+
+routes/apikeys.js — generate and revoke keys
+const router  = require('express').Router();
+const crypto  = require('crypto');
+const ApiKey  = require('../models/ApiKey');
+const jwtAuth = require('../middleware/jwtAuth');
+
+// POST /api/apikeys — generate a new key (dashboard user must be logged in)
+router.post('/', jwtAuth, async (req, res) => {
+  // Generate a random key with a recognisable prefix  e.g. ip_a3f9c2...
+  const rawKey = 'ip_' + crypto.randomBytes(32).toString('hex');
+  const keyHash = ApiKey.hashKey(rawKey);
+
+  await ApiKey.create({
+    teamId: req.user.teamId,
+    keyHash,
+    label: req.body.label || 'New key'
+  });
+ // Return raw key ONCE — we never store it, they must copy it now
+  res.json({
+    key: rawKey,
+    message: 'Copy this key now. It will not be shown again.'
+  });
+});
+
+// GET /api/apikeys — list keys (show label + lastUsed, never the raw key)
+router.get('/', jwtAuth, async (req, res) => {
+  const keys = await ApiKey.find({ teamId: req.user.teamId })
+    .select('-keyHash'); // never expose the hash either
+  res.json(keys);
+});
+
+// DELETE /api/apikeys/:id — revoke a key
+router.delete('/:id', jwtAuth, async (req, res) => {
+  await ApiKey.deleteOne({ _id: req.params.id, teamId: req.user.teamId });
+  res.json({ ok: true });
+});
+
+module.exports = router;
+
+middleware/apiKeyAuth.js — used on every client-facing route
+const ApiKey = require('../models/ApiKey');
+const Team   = require('../models/Team');
+
+module.exports = async (req, res, next) => {
+  const raw = req.headers['x-api-key'];   // client sends: X-API-Key: ip_abc123
+  if (!raw) return res.status(401).json({ error: 'Missing X-API-Key header' });
+
+  const hash = ApiKey.hashKey(raw);
+  const apiKey = await ApiKey.findOne({ keyHash: hash });
+  if (!apiKey) return res.status(401).json({ error: 'Invalid API key' });
+
+  // Update lastUsed silently
+  ApiKey.updateOne({ _id: apiKey._id }, { lastUsed: new Date() });
+
+  const team = await Team.findById(apiKey.teamId);
+  req.team = team;    // attach team to request for downstream use
+  next();
+};
+
+
+
+3. REPORT ENDPOINT
+
+routes/incidents.js
+const router       = require('express').Router();
+const Incident     = require('../models/Incident');
+const apiKeyAuth   = require('../middleware/apiKeyAuth');
+const rateLimiter  = require('../middleware/rateLimiter');
+const { detectSeverity } = require('../services/severityDetector');
+const { sendNotification } = require('../services/notificationService');
+const { getIO }    = require('../socket');
+
+// ─────────────────────────────────────────
+// POST /api/incidents/report
+// Called by client's backend when something breaks
+// ─────────────────────────────────────────
+router.post('/report', apiKeyAuth, rateLimiter, async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      service,           // e.g. "Payment API"
+      severity,          // optional — we auto-detect if missing
+      errorRate,         // e.g. 0.45 = 45% errors
+      responseTimeMs,    // e.g. 4500
+      affectedUsers,     // e.g. 1200
+      incidentId,        // if updating an existing incident
+      action             // "create" | "update" | "resolve"
+    } = req.body;
+
+    const teamId = req.team._id.toString();
+
+    // ── UPDATE existing incident ──────────────────
+    if (action === 'update' && incidentId) {
+      const incident = await Incident.findOneAndUpdate(
+        { _id: incidentId, teamId },
+        { $push: { timeline: { message: description, author: service, type: 'auto' } } },
+        { new: true }
+      );
+      getIO().to(teamId).emit('incident:updated', incident);
+      return res.json({ ok: true, incident });
+    }
+
+    // ── RESOLVE existing incident ─────────────────
+    if (action === 'resolve' && incidentId) {
+      const incident = await Incident.findOneAndUpdate(
+        { _id: incidentId, teamId },
+        {
+          status: 'resolved',
+          resolvedAt: new Date(),
+          $push: { timeline: { message: 'Service recovered. Auto-resolved.', author: service, type: 'auto' } }
+        },
+        { new: true }
+      );
+      getIO().to(teamId).emit('incident:resolved', incident);
+      return res.json({ ok: true, incident });
+    }
+
+    // ── CREATE new incident ───────────────────────
+    const autoSeverity = severity || detectSeverity({ errorRate, responseTimeMs, affectedUsers });
+
+    const incident = await Incident.create({
+      teamId,
+      title: title || `${service} is experiencing issues`,
+      severity: autoSeverity,
+      status: 'investigating',
+      source: 'api',
+      affectedServices: [service],
+      timeline: [{
+        message: description || `Incident reported by ${service}`,
+        author: service,
+        type: 'auto'
+      }]
+    });
+
+    // Notify via WebSocket AND email/slack
+    getIO().to(teamId).emit('incident:new', incident);
+    sendNotification(req.team, incident); // fire and forget
+
+    // Return incidentId so client can update/resolve it later
+    res.status(201).json({
+      ok: true,
+      incidentId: incident._id,
+      severity: autoSeverity
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+module.exports = router;
+
+
+
+4.AUTO SEVERITY
+
+services/severityDetector.js
+// Rules for auto-detecting severity from raw metrics
+// Client sends numbers — you return P1 / P2 / P3
+
+module.exports.detectSeverity = ({ errorRate, responseTimeMs, affectedUsers }) => {
+
+  // P1 — Critical. Immediate response needed.
+  if (
+    errorRate >= 0.5 ||          // 50%+ errors
+    responseTimeMs >= 10000 ||   // 10s+ response time
+    affectedUsers >= 1000        // 1000+ users impacted
+  ) return 'P1';
+
+  // P2 — Major. Investigate quickly.
+  if (
+    errorRate >= 0.1 ||          // 10%+ errors
+    responseTimeMs >= 3000 ||    // 3s+ response time
+    affectedUsers >= 100         // 100+ users impacted
+  ) return 'P2';
+
+  // P3 — Minor. Monitor it.
+  return 'P3';
+};
+
+// Example usage:
+// detectSeverity({ errorRate: 0.6, responseTimeMs: 1200, affectedUsers: 50 })
+// → 'P1'  (because errorRate >= 0.5)
+//
+// detectSeverity({ errorRate: 0.05, responseTimeMs: 4000, affectedUsers: 20 })
+// → 'P2'  (because responseTimeMs >= 3000)
+What the client sends to trigger this
+// In their Node.js error handler — they send raw numbers, you decide severity
+await fetch('https://yourapp.com/api/incidents/report', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-API-Key': 'ip_abc123...'
+  },
+  body: JSON.stringify({
+    service:        'Payment API',
+    description:    'Stripe webhook processor throwing 500s',
+    errorRate:      0.72,          // 72% of requests failing
+    responseTimeMs: 8400,          // avg 8.4s response
+    affectedUsers:  340
+    // no severity field — your platform detects it as P1
+  })
+});
+
+
+
+5.RATE LIMIT
+
+middleware/rateLimiter.js
+npm install express-rate-limit
+const rateLimit = require('express-rate-limit');
+
+// Each team can call /api/incidents/report max 60 times per hour
+module.exports = rateLimit({
+  windowMs: 60 * 60 * 1000,   // 1 hour window
+  max: 60,
+  keyGenerator: (req) => req.team._id.toString(), // per team, not per IP
+  handler: (req, res) => {
+    res.status(429).json({
+      error: 'Rate limit exceeded',
+      retryAfter: '1 hour',
+      limit: 60,
+      tip: 'Use action: update to add details to an existing incident instead of creating new ones'
+    });
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+The keyGenerator must use teamId, not IP address. Multiple services on the same company's server would share an IP and hit limits incorrectly. teamId keeps it per-account.
+
+
+
+6. CLINET SDK
+
+This is what makes Pattern B shine in the pitch. Instead of raw fetch() calls, you give clients a tiny SDK they can npm install. This is exactly how Sentry, Datadog, and LogRocket work.
+
+sdk/incident-reporter.js — the SDK you publish (or give as a file)
+// This is what clients paste into their project
+// They do: const { IncidentReporter } = require('./incident-reporter')
+// Or eventually: npm install @yourplatform/reporter
+
+class IncidentReporter {
+  constructor({ apiKey, baseUrl = 'https://yourapp.com' }) {
+    this.apiKey  = apiKey;
+    this.baseUrl = baseUrl;
+    this.openIncidents = {}; // tracks incidentId per service
+  }
+
+  async _call(body) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/incidents/report`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
+        body:    JSON.stringify(body)
+      });
+      return res.json();
+    } catch (e) {
+      // SDK never crashes the client app — fail silently
+      console.error('[IncidentReporter] Failed to report:', e.message);
+    }
+  }
+
+  // Start a new incident for a service
+  async report(service, description, metrics = {}) {
+    const result = await this._call({
+      action: 'create', service, description, ...metrics
+    });
+    if (result?.incidentId) {
+      this.openIncidents[service] = result.incidentId;
+    }
+    return result;
+  }
+
+  // Post an update to an ongoing incident
+  async update(service, description) {
+    const incidentId = this.openIncidents[service];
+    if (!incidentId) return;
+    await this._call({ action: 'update', service, description, incidentId });
+  }
+
+  // Resolve when service recovers
+  async resolve(service) {
+    const incidentId = this.openIncidents[service];
+    if (!incidentId) return;
+    await this._call({ action: 'resolve', service, incidentId });
+    delete this.openIncidents[service];
+  }
+}
+
+module.exports = { IncidentReporter };
+How the client uses the SDK — 3 lines total
+const { IncidentReporter } = require('./incident-reporter');
+
+const reporter = new IncidentReporter({ apiKey: 'ip_abc123...' });
+
+// In their payment error handler:
+try {
+  await processPayment(data);
+} catch (err) {
+  await reporter.report('Payment API', err.message, {
+    errorRate: 0.6,
+    affectedUsers: 200
+  });
+
+  // Later when it's fixed:
+  await reporter.resolve('Payment API');
+}
+This SDK is your pitch moment. "We don't just build a dashboard — we give teams a 3-line SDK to instrument their services. Same model as how Sentry works."
+
+
+7.NOTIFICATIONS
+
+When an incident is created, you need to tell the team immediately — not just update the UI. Email and Slack are the two channels that matter.
+
+services/notificationService.js
+npm install nodemailer  # for email
+# Slack needs no package — it's just a fetch() to their webhook URL
+const nodemailer = require('nodemailer');
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+});
+
+const SEVERITY_EMOJI = { P1: '🔴', P2: '🟠', P3: '🟡' };
+
+// Called after incident is created — fire and forget (no await needed)
+module.exports.sendNotification = async (team, incident) => {
+  const emoji = SEVERITY_EMOJI[incident.severity];
+  const subject = `${emoji} [${incident.severity}] ${incident.title}`;
+
+  // ── Email ──────────────────────────────────────
+  try {
+    await transporter.sendMail({
+      from:    `"Incident Platform" <${process.env.EMAIL_USER}>`,
+      to:      team.email,
+      subject,
+      html: `
+        <h2>${emoji} ${incident.title}</h2>
+        <p><strong>Severity:</strong> ${incident.severity}</p>
+        <p><strong>Service:</strong> ${incident.affectedServices.join(', ')}</p>
+        <p><strong>Status:</strong> ${incident.status}</p>
+        <a href="https://yourapp.com/incidents/${incident._id}">Open War Room →</a>
+      `
+    });
+  } catch (e) { console.error('Email failed:', e.message); }
+
+  // ── Slack (if team has Slack webhook configured) ───
+  if (team.slackWebhookUrl) {
+    try {
+      await fetch(team.slackWebhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: `${emoji} *[${incident.severity}] ${incident.title}*\nService: ${incident.affectedServices.join(', ')}\n<https://yourapp.com/incidents/${incident._id}|Open War Room>`
+        })
+      });
+    } catch (e) { console.error('Slack failed:', e.message); }
+  }
+};
+For the hackathon use Gmail with an App Password from Google Account settings. For Slack, teams paste their own incoming webhook URL in settings — you just call it.
+
+
+8. TEAM DASHBOARD
+
+These are the routes your React frontend calls to populate the dashboard — incident list, single incident details, analytics, and the public status page.
+
+routes/incidents.js — dashboard routes (JWT protected)
+const jwtAuth = require('../middleware/jwtAuth');
+
+// GET /api/incidents — list all for this team
+router.get('/', jwtAuth, async (req, res) => {
+  const { status, severity, limit = 20, page = 1 } = req.query;
+  const filter = { teamId: req.user.teamId };
+  if (status)   filter.status   = status;
+  if (severity) filter.severity = severity;
+
+  const incidents = await Incident
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .limit(Number(limit))
+    .skip((page - 1) * limit);
+
+  res.json(incidents);
+});
+
+// GET /api/incidents/:id — single incident with full timeline
+router.get('/:id', jwtAuth, async (req, res) => {
+  const incident = await Incident.findOne({
+    _id: req.params.id, teamId: req.user.teamId
+  });
+  if (!incident) return res.status(404).json({ error: 'Not found' });
+  res.json(incident);
+});
+
+// GET /api/incidents/analytics/mttr — mean time to resolve
+router.get('/analytics/mttr', jwtAuth, async (req, res) => {
+  const resolved = await Incident.find({
+    teamId: req.user.teamId,
+    status: 'resolved',
+    resolvedAt: { $exists: true }
+  });
+
+  if (!resolved.length) return res.json({ mttrMinutes: 0, count: 0 });
+
+  const totalMs = resolved.reduce((sum, i) =>
+    sum + (i.resolvedAt - i.createdAt), 0);
+
+  res.json({
+    mttrMinutes: Math.round(totalMs / resolved.length / 60000),
+    count: resolved.length,
+    byService: groupByService(resolved) // helper to group stats per service
+  });
+});
+
+// GET /api/status/:teamId — PUBLIC, no auth — for the status page
+router.get('/status/:teamId', async (req, res) => {
+  const activeIncidents = await Incident.find({
+    teamId: req.params.teamId,
+    status: { $ne: 'resolved' }
+  }).select('title severity status affectedServices createdAt');
+
+  const recentHistory = await Incident.find({
+    teamId: req.params.teamId,
+    status: 'resolved'
+  }).sort({ resolvedAt: -1 }).limit(10)
+    .select('title severity createdAt resolvedAt affectedServices');
+
+  res.json({
+    operational: activeIncidents.length === 0,
+    activeIncidents,
+    recentHistory
+  });
+});
+
+The /status/:teamId endpoint is public — no auth needed. Your React status page just polls this every 30 seconds (or uses WebSocket). The client shares this URL with their users: status.yourapp.com/acme
