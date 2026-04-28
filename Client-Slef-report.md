@@ -1,21 +1,4 @@
 
-### 🔥 Root causes (in your file)
-
-1. Some diagrams still have **implicit chaining / compact syntax**
-2. Some node labels contain characters like:
-
-   * `/` (e.g. `POST /api/...`)
-   * `()` (e.g. `report()`)
-3. GitHub Mermaid sometimes breaks unless labels are wrapped safely
-
----
-
-## ✅ ✅ FULLY FIXED (GitHub-safe versions)
-
-Replace your diagrams with these **exact versions**.
-
----
-
 # ✅ 1. Full System Architecture (FIXED)
 
 ```mermaid
