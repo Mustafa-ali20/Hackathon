@@ -2,7 +2,8 @@
 Docs
 The core idea is simple: Your platform is just a middleman that listens for signals. It doesn't go and "check" other websites — other tools send signals TO you. Here's how that chain works.
 First, the big picture — who talks to who:
-<img width="1440" height="1040" alt="image" src="https://github.com/user-attachments/assets/0e64e0e4-23f1-4e73-a736-ddd1da99e296" />
+![image](https://github.com/user-attachments/assets/0e64e0e4-23f1-4e73-a736-ddd1da99e296)
+<img width="1440" height="1040" alt="image" src="" />
 
 Now let me break down what a webhook actually is, because this is the concept that everything else depends on:
 <img width="1440" height="920" alt="image" src="https://github.com/user-attachments/assets/3cdd8f69-248e-4f00-a74f-e2f02d2b19c4" />
