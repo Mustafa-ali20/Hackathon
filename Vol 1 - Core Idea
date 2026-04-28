@@ -1,35 +1,55 @@
-# Hackathon Docs
+# 🚨 Hackathon Docs
 
-## The Core Idea
+## 📌 The Core Idea
 
-The core idea is simple: Your platform is just a middleman that listens for signals. It doesn't go and "check" other websites — other tools send signals TO you. Here's how that chain works.
+The core idea is simple: your platform acts as a **middleman that listens for signals**.
 
-### First, the big picture — who talks to who:
+It does NOT actively check other websites.  
+Instead, external tools send signals **to your system**.
 
-![Architecture Overview](./images/core-architecture.png)
+---
 
-### What is a Webhook?
+## 🔗 Big Picture — Who Talks to Who
 
-Now let me break down what a webhook actually is, because this is the concept that everything else depends on:
+
+---
+
+## 🔔 What is a Webhook?
+
+A **webhook** is a way for one system to send real-time data to another system when an event happens.
+
+Instead of constantly asking:
+> “Did something happen?”
+
+Your system gets notified instantly:
+> “Something just happened.”
+
+### 📊 Webhook Flow
 
 ![Webhook Flow](./images/webhook-concept.png)
 
-### Backend Webhook Processing
+---
 
-Now the most important part — what actually happens in your backend when that webhook arrives, and how you fake it for the demo:
+## ⚙️ Backend Webhook Processing
+
+This is the **most important part** — what happens when your backend receives a webhook.
+
+For your hackathon, you’re simulating this behavior.
+
+### 📊 Backend Processing Flow
 
 ![Backend Processing Flow](./images/webhook-backend-flow.png)
 
-## Alert Simulator for Demo
+---
 
-For the hackathon demo — the "Alert Simulator"
+## 🧪 Alert Simulator (Demo Feature)
 
-You build a button inside YOUR OWN app that fires a fake webhook to `/api/webhooks/inbound/demo`.
+For the hackathon demo, you include an **Alert Simulator**.
 
-Judges see the exact same flow — alert fires, incident appears, status page goes red. All real. Trigger is just internal.
+### 💡 How it works:
 
-## User Onboarding Flow
+- You create a button inside your app
+- That button sends a **fake webhook request** to:
 
-And finally — here's the full picture of what a user (a company) actually does to onboard onto your platform:
-
-![User Onboarding](./images/user-onboarding.png)
+```bash
+/api/webhooks/inbound/demo
