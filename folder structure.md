@@ -73,6 +73,9 @@ backend/
     │   ├── socket/
     │   └── analytics/
     │
+    ├── dao/
+    │   └── user.dao.js
+    │
     ├── middleware/          # Express middlewares
     │   ├── auth.middleware.js
     │   ├── apiKey.middleware.js
